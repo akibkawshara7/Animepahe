@@ -26,10 +26,10 @@ def random_user_agent():
 # -------------------- AnimePahe Class --------------------
 class AnimePahe:
     def __init__(self):
-        self.base = "https://animepahe.si"
+        self.base = "https://animepahe.pw"
         self.headers = {
             "User-Agent": random_user_agent(),
-            "Referer": "https://animepahe.si/",
+            "Referer": "https://animepahe.pw/",
         }
         self.session = tls_client.Session(client_identifier="chrome_120")
 
