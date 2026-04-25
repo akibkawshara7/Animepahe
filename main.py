@@ -5,44 +5,45 @@ import tempfile
 import os
 import execjs
 from bs4 import BeautifulSoup
-from typing import Optional
-from fastapi import FastAPI, HTTPException
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 import tls_client
 
 # -------------------- Utility --------------------
 def random_user_agent():
     agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) Version/16.1 Safari/605.1.15",
-        "Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
+        "Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
     ]
     return random.choice(agents)
 
 
-# -------------------- AnimePahe Class --------------------
+# -------------------- AnimePahe Scraper Class --------------------
 class AnimePahe:
     def __init__(self):
-        self.base = "https://animepahe.pw"
+        # Master Akib, updating to .com as requested
+        self.base = "https://animepahe.com"
         self.headers = {
             "User-Agent": random_user_agent(),
-            "Referer": "https://animepahe.pw/",
+            "Referer": f"{self.base}/",
         }
+        # Using chrome_120 to bypass basic TLS fingerprinting
         self.session = tls_client.Session(client_identifier="chrome_120")
 
     async def get(self, url: str):
-        """Run tls-client GET asynchronously"""
+        """Run tls-client GET asynchronously to avoid blocking the event loop."""
         def _req():
-            r = self.session.get(url, headers=self.headers)
-            return r
+            return self.session.get(url, headers=self.headers)
         return await asyncio.to_thread(_req)
 
     async def search(self, query: str):
         url = f"{self.base}/api?m=search&q={query}"
         r = await self.get(url)
+        if r.status_code != 200:
+            raise Exception(f"Search failed with status {r.status_code}")
+        
         data = r.json()
         results = []
         for a in data.get("data", []):
@@ -57,39 +58,47 @@ class AnimePahe:
             })
         return results
 
-    async def get_episodes(self, anime_session: str):
-        html = (await self.get(f"{self.base}/anime/{anime_session}")).text
-        soup = BeautifulSoup(html, "html.parser")
+    async def get_episodes(self, anime_session: str, page: int = 1):
+        # First, we need the internal ID from the anime page
+        html_resp = await self.get(f"{self.base}/anime/{anime_session}")
+        soup = BeautifulSoup(html_resp.text, "html.parser")
+        
+        # The internal ID is often found in the og:url or scripts
         meta = soup.find("meta", {"property": "og:url"})
         if not meta:
-            raise Exception("Could not find session ID in meta tag")
-        temp_id = meta["content"].split("/")[-1]
+            raise Exception("Could not find session ID in meta tags")
+            
+        internal_id = meta["content"].split("/")[-1]
 
-        first_page_json = (await self.get(f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page=1")).json()
-        episodes = first_page_json.get("data", [])
-        last_page = first_page_json.get("last_page", 1)
-
-        async def fetch_page(p):
-            return (await self.get(f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page={p}")).json().get("data", [])
-
-        tasks = [fetch_page(p) for p in range(2, last_page + 1)]
-        for pages in await asyncio.gather(*tasks):
-            episodes.extend(pages)
-
-        return [
-            {
+        # Fetch episodes using the internal ID
+        api_url = f"{self.base}/api?m=release&id={internal_id}&sort=episode_asc&page={page}"
+        r = await self.get(api_url)
+        data = r.json()
+        
+        episodes = []
+        for e in data.get("data", []):
+            episodes.append({
                 "id": e["id"],
                 "number": e["episode"],
                 "title": e.get("title") or f"Episode {e['episode']}",
                 "snapshot": e.get("snapshot"),
                 "session": e["session"],
-            }
-            for e in episodes
-        ]
+            })
+            
+        return {
+            "total": data.get("total"),
+            "per_page": data.get("per_page"),
+            "current_page": data.get("current_page"),
+            "last_page": data.get("last_page"),
+            "episodes": episodes
+        }
 
     async def get_sources(self, anime_session: str, episode_session: str):
-        html = (await self.get(f"{self.base}/play/{anime_session}/{episode_session}")).text
+        play_url = f"{self.base}/play/{anime_session}/{episode_session}"
+        r = await self.get(play_url)
+        html = r.text
 
+        # Regex to find the data-src (Kwik links) in buttons
         buttons = re.findall(
             r'<button[^>]+data-src="([^"]+)"[^>]+data-fansub="([^"]+)"[^>]+data-resolution="([^"]+)"[^>]+data-audio="([^"]+)"[^>]*>',
             html
@@ -97,7 +106,7 @@ class AnimePahe:
 
         sources = []
         for src, fansub, resolution, audio in buttons:
-            if src.startswith("https://kwik."):
+            if "kwik." in src:
                 sources.append({
                     "url": src,
                     "quality": f"{resolution}p",
@@ -105,115 +114,103 @@ class AnimePahe:
                     "audio": audio
                 })
 
+        # Fallback search for kwik links if buttons aren't parsed
         if not sources:
-            kwik_links = re.findall(r"https:\/\/kwik\.(si|cx|link)\/e\/\w+", html)
-            sources = [{"url": link, "quality": None, "fansub": None, "audio": None} for link in kwik_links]
+            kwik_links = re.findall(r"https?://kwik\.(si|cx|link)/e/\w+", html)
+            sources = [{"url": link, "quality": "Unknown", "fansub": "Unknown", "audio": "Unknown"} for link in kwik_links]
 
-        unique_sources = list({s["url"]: s for s in sources}.values())
-
+        # Sort by quality (highest first)
         def sort_key(s):
-            try:
-                return int(s["quality"].replace("p", "")) if s["quality"] else 0
-            except Exception:
-                return 0
-        unique_sources.sort(key=sort_key, reverse=True)
+            try: return int(s["quality"].replace("p", ""))
+            except: return 0
+        
+        sources.sort(key=sort_key, reverse=True)
+        return sources
 
-        if not unique_sources:
-            raise Exception("No kwik links found on play page")
+    async def resolve_m3u8(self, kwik_url: str):
+        """
+        Resolves the Kwik link to a direct .m3u8 URL using a Node.js sandbox.
+        Requires 'node' to be installed on the system.
+        """
+        r = await self.get(kwik_url)
+        html = r.text
+        
+        # Check if direct m3u8 exists first
+        direct_m = re.search(r"https?://[^'\"\s<>]+\.m3u8", html)
+        if direct_m:
+            return direct_m.group(0)
 
-        return unique_sources
-
-    async def resolve_kwik_with_node(self, kwik_url: str, node_bin: str = "node") -> str:
-        """Use tls-client and Node.js to extract .m3u8"""
-        resp = await self.get(kwik_url)
-        print(f"\n[DEBUG] Kwik HTTP {resp.status_code}: {kwik_url}")
-        print("="*80)
-        print(resp.text[:2000])
-        print("="*80 + "\n")
-
-        html = resp.text
-        m3u8_direct = re.search(r"https?://[^'\"\s<>]+\.m3u8", html)
-        if m3u8_direct:
-            return m3u8_direct.group(0)
-
+        # Look for the packed JS code (eval script)
         scripts = re.findall(r"(<script[^>]*>[\s\S]*?</script>)", html, re.IGNORECASE)
-        script_block, largest_eval_script, max_len = None, None, 0
+        script_block = None
         for s in scripts:
-            if "eval(" in s:
-                if "Plyr" in s or ".m3u8" in s or "source" in s or "uwu" in s:
-                    script_block = s
-                    break
-                if len(s) > max_len:
-                    max_len = len(s)
-                    largest_eval_script = s
+            if "eval(function(p,a,c,k,e,d)" in s:
+                script_block = s
+                break
+        
         if not script_block:
-            script_block = largest_eval_script
-        if not script_block:
-            raise Exception("No candidate <script> block found")
+            raise Exception("Could not find the JS execution block on Kwik page.")
 
-        inner_js = re.sub(r"^<script[^>]*>", "", script_block, flags=re.IGNORECASE).strip()
-        inner_js = re.sub(r"</script>$", "", inner_js, flags=re.IGNORECASE).strip()
+        # Clean script tags
+        js_code = re.sub(r"<(/?script[^>]*)>", "", script_block, flags=re.IGNORECASE).strip()
 
-        wrapper = r"""
-globalThis.window = { location: {} };
-globalThis.document = { cookie: '' };
-globalThis.navigator = { userAgent: 'mozilla' };
-const __captured = [];
-const origLog = console.log;
-console.log = (...args)=>{__captured.push(args.join(' '));origLog(...args);};
-(function(){
-  const origEval = eval;
-  eval = (x)=>{__captured.push('[EVAL]' + x);return origEval(x);};
-})();
-"""
-        final_js = wrapper + "\n" + inner_js + "\n" + (
-            "setTimeout(()=>{for(const c of __captured){console.log('__CAPTURED__START__');"
-            "console.log(c);console.log('__CAPTURED__END__');}process.exit(0)},300);"
-        )
+        # Wrap in a capturer for Node.js
+        wrapper = """
+        const __captured = [];
+        const originalEval = eval;
+        global.eval = (code) => {
+            __captured.push(code);
+            return originalEval(code);
+        };
+        """
+        # Execute script and print result
+        final_js = f"{wrapper}\n{js_code}\nconsole.log(__captured.join('\\n'));"
 
         with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tf:
-            tmp_path = tf.name
             tf.write(final_js)
-            tf.flush()
+            temp_name = tf.name
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                node_bin, tmp_path,
+                "node", temp_name,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = await proc.communicate()
+            stdout, _ = await proc.communicate()
+            output = stdout.decode()
+            
+            # Extract .m3u8 from the unpacked JS
+            m3u8_link = re.search(r"https?://[^'\"\s]+\.m3u8[^\s'\"\)]*", output)
+            if m3u8_link:
+                return m3u8_link.group(0)
+            
+            raise Exception("Node execution succeeded but no m3u8 link was found in output.")
         finally:
-            os.unlink(tmp_path)
-
-        out = (stdout.decode(errors="ignore") + stderr.decode(errors="ignore"))
-        m = re.search(r"https?://[^'\"\s]+\.m3u8[^\s'\"\)]*", out)
-        if m:
-            return m.group(0)
-
-        raise Exception(f"Could not resolve .m3u8. Node output:\n{out[:1000]}")
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
 
 
-# -------------------- FastAPI --------------------
-app = FastAPI()
+# -------------------- FastAPI Setup --------------------
+app = FastAPI(title="AnimePahe Unofficial API")
 pahe = AnimePahe()
 
+@app.get("/")
+async def root():
+    return {"message": "AnimePahe API is running. Master Akib, use /docs for testing."}
 
 @app.get("/search")
-async def api_search(q: str):
+async def api_search(q: str = Query(..., description="Anime title to search")):
     try:
         return await pahe.search(q)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/episodes")
-async def api_episodes(session: str):
+@app.get("/episodes/{anime_session}")
+async def api_episodes(anime_session: str, page: int = 1):
     try:
-        return await pahe.get_episodes(session)
+        return await pahe.get_episodes(anime_session, page)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/sources")
 async def api_sources(anime_session: str, episode_session: str):
@@ -222,11 +219,15 @@ async def api_sources(anime_session: str, episode_session: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/m3u8")
-async def api_resolve_kwik(url: str):
+@app.get("/resolve")
+async def api_resolve(url: str):
     try:
-        m3u8 = await pahe.resolve_kwik_with_node(url)
+        m3u8 = await pahe.resolve_m3u8(url)
         return {"m3u8": m3u8}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
